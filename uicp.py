@@ -2,9 +2,20 @@
 
 """
 A protocol for transmitting the 0s and 1s of any interface over UDP in such a
-way as that the receiving or transmitting node sees the interface as physically
-local in the sense of something such as a USB device whereby you connect to the
-given node via plugging in the device.  This protocol does just that via UDP.
+way as that the receiving node sees the interface as physically local in the
+sense of something such as a USB controlled device whereby you connect to the
+given device by plugging it into the USB port.
+
+Due to what seem as limitations in the linux kernel and the way that scapy
+sniffs, this does not work as initially intended.  This code will relay an
+interface's traffic over UDP and be represented as [Raw].load; the gap exists
+where scapy will see traffic sent to wlan2mon even though it is sniffing on
+wlan3mon.  This results in a cascading cycle making the protocol unfeasible in
+the current format.
+
+References
+https://www.suse.com/c/creating-virtual-wlan-interfaces/
+https://github.com/secdev/scapy/issues/724#
 """
 
 import argparse
@@ -16,6 +27,7 @@ import signal
 import sys
 import time
 import traceback
+from easyThread import Backgrounder
 from queue import Queue
 from scapy.all import *
 # from scapy.sendrecv import __gen_send as gs
@@ -45,7 +57,6 @@ class Handler(object):
         # self.injSocket = conf.L2socket(iface = interface)
         # self.injSocket = conf.L3socket(iface = interface)
 
-
     def listener(self, work):
         """Listens for inbound on tap0 and then sends to the stager"""
         while True:
@@ -74,11 +85,28 @@ class Handler(object):
 
     def repeater(self, work):
         """Listens for inbound on tap2 and then sends to the destination"""
+        # while True:
+        #     r = self.RR.get()
+        #     if r is not None:
+        #         print('Repeater received')
+        #         print(r.summary())
+        #         self.RR.task_done()
         while True:
+
+
+
+
             r = self.RR.get()
+            ### Can enter here too for NIC control via the client.
+
             if r is not None:
                 print('Repeater received')
                 print(r.summary())
+
+
+                ### This is our entry point for NIC control via the client.
+
+
                 self.RR.task_done()
 
 
@@ -165,11 +193,33 @@ class Handler(object):
             rrBgII.easyLaunch()
             return rr, rrEt, rrBg
 
+
+class Shared(object):
+    __slots__ = ['args']
+
+    def __init__(self, args):
+        self.args = args
+
+    # def handler(self):
+    #     def snarf(pkt):
+    #
+    #     return snarf
+
+    def clientSniff(self):
+        """Enable a stream inbound to wlan2mon for sniffing from the NIC"""
+        sniff(iface = self.args.monnic,
+              prn = lambda x: sendp(RadioTap(x[Raw].load),
+                                    iface = self.args.snfnic,
+                                    verbose = 0),
+              store = 0,
+              filter = self.args.bpf)
+
+
 def crtlC():
     """Handle CTRL+C."""
     def tmp(signal, frame):
         for i in psutil.process_iter():
-            if 'uicp.py' in ' '.join(i.cmdline()):
+            if 'uicp.py' in ' '.join(i.cmdline()) or 'ipython3' in ' '.join(i.cmdline()):
                 i.kill()
     return tmp
 
@@ -185,6 +235,8 @@ def rrWork(self):
     """Repeater work"""
     rret.easyLaunch()
 
+
+
 if __name__ == '__main__':
     ## Args
     parser = argparse.ArgumentParser(description = 'placeholder')
@@ -193,6 +245,8 @@ if __name__ == '__main__':
     parser.add_argument('--dstip', help = 'destination ip', required = True)
     parser.add_argument('--injnic', help = 'injection nic')
     parser.add_argument('--monnic', help = 'monitoring nic', required = True)
+    parser.add_argument('--snfnic', help = 'sniffing nic')
+    parser.add_argument('--srcmac', help = 'source mac')
     parser.add_argument('--srcport', help = 'source port', required = True)
     parser.add_argument('--srcip', help = 'source ip', required = True)
     parser.add_argument('-c', action = 'store_true', help = 'run as client')
@@ -267,6 +321,8 @@ if __name__ == '__main__':
     ## Raw BPF
     if args.bpf is None:
         if args.c is True:
+
+            ### Clean this up more
             args.bpf = 'udp port {0} and ((src {1} and dst {2}) or (dst {1} and src {2}))'.format(args.srcport, args.srcip, args.dstip)
 
     ## Server
@@ -287,15 +343,56 @@ if __name__ == '__main__':
             print('--injnic required with -c')
             sys.exit(1)
 
+        if args.snfnic is None:
+            print('--snfnic required with -c')
+            sys.exit(1)
+
         ## Create virtual wlan devices
         os.system('modprobe mac80211_hwsim radios=3')
         time.sleep(2)
         os.system('airmon-ng start wlan2')                                      ## Ugly hardcode, fix later
+        os.system('airmon-ng start wlan3')
         time.sleep(3)
 
-        sniff(iface = args.monnic,
-              prn = lambda x: sendp(RadioTap(x[Raw].load),
-                                    iface = args.injnic,
-                                    verbose = 0),
-              store = 0,
-              filter = args.bpf)
+        ## Background virtual sniffing
+        sh = Shared(args)
+        Backgrounder.theThread = sh.clientSniff
+        bg = Backgrounder()
+        bg.easyLaunch()
+
+        """
+        At this point in the code clientSniff is sniffing the traffic from wlan0
+        and relaying it via sendp() to wlan2mon.
+
+        From here a tool such as aircrack-ng or kismet would grab the frames.
+        If the intent had been for the tool to interact on the same NIC as it
+        was sniffing then wlan3mon would have been used as the final relay in
+        cycle.
+
+        Setup the client using IPython:
+        %run ./uicp.py --dstip <IP of the server> --dstport 20007 --monnic wlan0 --srcport 20001 --srcip <IP of the client> -c --snfnic wlan2mon --injnic wlan3mon
+
+        In a different shell launch the following:
+        p = sniff(iface = 'wlan3mon', prn = lambda x: send(IP(src = <IP of the client>, dst = <IP of the server>)/\
+                                                       UDP(sport = 30000, dport = 30001)/\
+                                                       Raw(load = x),
+                                                       verbose = 1),
+              store = 1,
+              count = 1)
+
+        In another shell perform a sendp() to wlan2mon and then wlan3mon, doing
+        so will allow you to replicate the duplicate issue.
+        """
+        # Virtual injection to the server
+        print(args)
+
+        ## Broken due to duplicates
+        sniff(iface = args.injnic,
+              prn = lambda x: send(IP(src = args.srcip, dst = args.dstip)/\
+                                   UDP(sport = int(args.srcport), dport = int(args.dstport))/\
+                                   Raw(load = x),
+                                   verbose = 1),
+              lfilter = lambda y: y[Dot11].addr1 == args.srcmac or\
+                                  y[Dot11].addr2 == args.srcmac or\
+                                  y[Dot11].addr3 == args.srcmac,
+              store = 0)
